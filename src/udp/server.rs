@@ -7,14 +7,12 @@ use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::core::driver::{CommandMode, SensorDriver};
+use crate::core::driver::SensorDriver;
 use crate::protocol::packet::{MessageType, Packet, DEFAULT_PUSH_INTERVAL_MS};
-use crate::udp::stream::run_stream_loop;
 
 const MAX_PACKET_SIZE: usize = 4096;
 
 struct Subscriber {
-    interval: Duration,
     cancel: CancellationToken,
 }
 
@@ -76,13 +74,7 @@ pub async fn spawn_sensor_udp(
                         }
 
                         let cancel = CancellationToken::new();
-                        subs.insert(
-                            addr,
-                            Subscriber {
-                                interval,
-                                cancel: cancel.clone(),
-                            },
-                        );
+                        subs.insert(addr, Subscriber { cancel: cancel.clone() });
 
                         // Spawn a push task for this subscriber
                         let push_sock = data_sock.clone();
@@ -153,7 +145,6 @@ pub async fn spawn_sensor_udp(
 
     tokio::spawn(async move {
         let mut buf = [0u8; MAX_PACKET_SIZE];
-        let mut active_stream: Option<CancellationToken> = None;
 
         loop {
             let (len, addr) = match cmd_sock.recv_from(&mut buf).await {
@@ -185,52 +176,6 @@ pub async fn spawn_sensor_udp(
                     match cmd_driver.execute_command(&payload) {
                         Ok(result) => Packet::command_ack(packet.seq_num, &result),
                         Err(e) => Packet::error(packet.seq_num, &e.to_string()),
-                    }
-                }
-
-                MessageType::StreamStart => {
-                    if let Some(token) = active_stream.take() {
-                        token.cancel();
-                    }
-
-                    let interval = match cmd_driver.command_mode() {
-                        CommandMode::Stream { interval_ms } => {
-                            Duration::from_millis(interval_ms)
-                        }
-                        CommandMode::Rest => {
-                            let r = Packet::error(
-                                packet.seq_num,
-                                "sensor does not support streaming; use Command (0x10) instead",
-                            );
-                            let _ = cmd_sock.send_to(&r.encode(), addr).await;
-                            continue;
-                        }
-                    };
-
-                    let payload = match packet.json_payload() {
-                        Ok(p) => p,
-                        Err(e) => {
-                            let r = Packet::error(packet.seq_num, &e.to_string());
-                            let _ = cmd_sock.send_to(&r.encode(), addr).await;
-                            continue;
-                        }
-                    };
-
-                    let cancel = CancellationToken::new();
-                    active_stream = Some(cancel.clone());
-
-                    let stream_driver = cmd_driver.clone();
-                    tokio::spawn(run_stream_loop(stream_driver, payload, interval, cancel));
-
-                    Packet::stream_ack(packet.seq_num, "started")
-                }
-
-                MessageType::StreamStop => {
-                    if let Some(token) = active_stream.take() {
-                        token.cancel();
-                        Packet::stream_ack(packet.seq_num, "stopped")
-                    } else {
-                        Packet::stream_ack(packet.seq_num, "no active stream")
                     }
                 }
 

@@ -24,16 +24,11 @@ pub enum MessageType {
     SubscribeAck = 0x04,
 
     // --- Commands (command port) ---
-    /// Client -> Server: one-shot command with JSON payload.
+    /// Client -> Server: command with JSON payload.
+    /// For stream-mode drivers, the client sends this continuously at the driver's interval.
     Command = 0x10,
     /// Server -> Client: command result JSON.
     CommandAck = 0x11,
-    /// Client -> Server: begin streaming a command (for watchdog sensors).
-    StreamStart = 0x12,
-    /// Client -> Server: stop streaming.
-    StreamStop = 0x13,
-    /// Server -> Client: acknowledgement for stream start/stop.
-    StreamAck = 0x14,
 
     // --- General ---
     /// Server -> Client: error message.
@@ -49,9 +44,6 @@ impl MessageType {
             0x04 => Some(Self::SubscribeAck),
             0x10 => Some(Self::Command),
             0x11 => Some(Self::CommandAck),
-            0x12 => Some(Self::StreamStart),
-            0x13 => Some(Self::StreamStop),
-            0x14 => Some(Self::StreamAck),
             0xFF => Some(Self::Error),
             _ => None,
         }
@@ -118,26 +110,6 @@ impl Packet {
             MessageType::CommandAck,
             seq,
             serde_json::to_vec(result).unwrap_or_default(),
-        )
-    }
-
-    pub fn stream_start(seq: u16, payload: &serde_json::Value) -> Self {
-        Self::new(
-            MessageType::StreamStart,
-            seq,
-            serde_json::to_vec(payload).unwrap_or_default(),
-        )
-    }
-
-    pub fn stream_stop(seq: u16) -> Self {
-        Self::new(MessageType::StreamStop, seq, Vec::new())
-    }
-
-    pub fn stream_ack(seq: u16, msg: &str) -> Self {
-        Self::new(
-            MessageType::StreamAck,
-            seq,
-            serde_json::to_vec(&serde_json::json!({"status": msg})).unwrap_or_default(),
         )
     }
 

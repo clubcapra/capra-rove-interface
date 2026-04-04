@@ -3,16 +3,17 @@ use std::time::Duration;
 
 use super::error::DriverError;
 
-/// Whether commands are one-shot or must be continuously re-sent.
+/// Whether commands are one-shot or arrive as a continuous stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[serde(tag = "type")]
 pub enum CommandMode {
-    /// Request/response: send once, get one reply.
+    /// Request/response: client sends a single command, server replies once.
     Rest,
-    /// Streaming: command must be re-sent at `interval_ms` to satisfy
-    /// a hardware watchdog (e.g. CAN bus motor controllers).
+    /// Streaming: client sends Command packets continuously at `interval_ms`.
+    /// Each packet is processed as it arrives — the server does not loop or
+    /// re-send anything. Typical use: CAN control loops sending ODrive setpoints.
     Stream {
-        /// Re-send interval in milliseconds.
+        /// Expected client send interval in milliseconds.
         interval_ms: u64,
     },
 }
@@ -71,10 +72,10 @@ impl FieldDescriptor {
 /// That's it. The framework handles UDP sockets, HTTP routes, and documentation.
 pub trait SensorDriver: Send + Sync + 'static {
     /// Unique string ID used in UDP port mapping and HTTP routes.
-    fn id(&self) -> &'static str;
+    fn id(&self) -> &str;
 
     /// Human-readable name shown in Scalar UI.
-    fn display_name(&self) -> &'static str;
+    fn display_name(&self) -> &str;
 
     /// Describes the data fields this sensor produces.
     fn data_schema(&self) -> Vec<FieldDescriptor>;
@@ -88,7 +89,65 @@ pub trait SensorDriver: Send + Sync + 'static {
     /// Read current sensor data. Returns a JSON-serializable value.
     fn read_data(&self) -> Result<Value, DriverError>;
 
-    /// Execute a command. For Stream-mode drivers, the framework
-    /// calls this repeatedly at the configured interval.
+    /// Execute a command. For Stream-mode drivers this is called once per
+    /// incoming packet — the client is responsible for the send rate.
     fn execute_command(&self, payload: &Value) -> Result<Value, DriverError>;
+
+    /// Whether this driver supports emergency stop.
+    fn has_estop(&self) -> bool {
+        false
+    }
+
+    /// Trigger an emergency stop. Only called if `has_estop()` returns true.
+    fn estop(&self) -> Result<Value, DriverError> {
+        Err(DriverError::CommandFailed("estop not supported".into()))
+    }
+
+    /// Whether this driver supports configuration read/write via SDO.
+    fn has_config(&self) -> bool {
+        false
+    }
+
+    /// Read all config-namespace parameters from the device (dynamically from endpoint map).
+    fn read_config(&self) -> Result<Value, DriverError> {
+        Err(DriverError::CommandFailed("config not supported".into()))
+    }
+
+    /// Write configuration parameters to the device.
+    /// `config` is a JSON object keyed by flat endpoint path, e.g.
+    /// `{"axis0.controller.config.vel_limit": 20.0}`.
+    fn write_config(&self, config: &Value) -> Result<Value, DriverError> {
+        Err(DriverError::CommandFailed("config not supported".into()))
+    }
+
+    /// Whether this driver supports triggering a calibration sequence.
+    fn has_calibrate(&self) -> bool {
+        false
+    }
+
+    /// Trigger a calibration sequence.
+    /// `params` may include `{"type": "full"|"motor"|"encoder_index"|"encoder_offset"}`.
+    fn calibrate(&self, params: &Value) -> Result<Value, DriverError> {
+        Err(DriverError::CommandFailed("calibration not supported".into()))
+    }
+
+    /// Whether this driver supports individual endpoint read/write by path.
+    fn has_endpoint_access(&self) -> bool {
+        false
+    }
+
+    /// List all endpoints in the loaded map (no CAN I/O — just metadata).
+    fn list_endpoints(&self) -> Result<Value, DriverError> {
+        Err(DriverError::CommandFailed("endpoint access not supported".into()))
+    }
+
+    /// Read a single endpoint by its flat-endpoint path (e.g. `"axis0.config.motor.vel_limit"`).
+    fn read_endpoint(&self, _path: &str) -> Result<Value, DriverError> {
+        Err(DriverError::CommandFailed("endpoint access not supported".into()))
+    }
+
+    /// Write a single endpoint. Body: `{"value": <number|bool>}`.
+    fn write_endpoint(&self, _path: &str, _val: &Value) -> Result<Value, DriverError> {
+        Err(DriverError::CommandFailed("endpoint access not supported".into()))
+    }
 }

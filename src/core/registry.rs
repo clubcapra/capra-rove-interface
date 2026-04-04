@@ -15,6 +15,14 @@ pub struct SensorInfo {
     pub command_mode: CommandMode,
     pub data_port: u16,
     pub command_port: u16,
+    /// Whether this sensor supports emergency stop.
+    pub has_estop: bool,
+    /// Whether this sensor supports configuration read/write (SDO).
+    pub has_config: bool,
+    /// Whether this sensor supports triggering a calibration sequence.
+    pub has_calibrate: bool,
+    /// Whether this sensor supports individual endpoint read/write by path.
+    pub has_endpoint_access: bool,
 }
 
 /// Central store for all registered sensor drivers.
@@ -87,6 +95,10 @@ impl SensorRegistry {
                     command_mode: driver.command_mode(),
                     data_port,
                     command_port: cmd_port,
+                    has_estop: driver.has_estop(),
+                    has_config: driver.has_config(),
+                    has_calibrate: driver.has_calibrate(),
+                    has_endpoint_access: driver.has_endpoint_access(),
                 }
             })
             .collect()

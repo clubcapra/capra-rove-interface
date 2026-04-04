@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Html;
 use axum::routing::{get, post};
@@ -9,6 +9,7 @@ use serde_json::Value;
 
 use crate::core::driver::{CommandMode, FieldDescriptor, SensorDriver};
 use crate::core::registry::{SensorInfo, SensorRegistry};
+use crate::drivers::odrive::endpoints::{load_from_str, SharedEndpointMap};
 use crate::protocol::packet;
 
 // ── Response types ──────────────────────────────────────────────────────────
@@ -34,6 +35,14 @@ pub struct SensorEndpoints {
     pub info: String,
     pub data: String,
     pub command: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estop: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calibrate: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoints: Option<String>,
 }
 
 #[derive(serde::Serialize, utoipa::ToSchema)]
@@ -117,31 +126,12 @@ fn build_protocol_info(info: &SensorInfo) -> UdpProtocolInfo {
     let cmd_flow = match &info.command_mode {
         CommandMode::Rest => "Client --Command(0x10)--> Robot --CommandAck(0x11)--> Client".to_string(),
         CommandMode::Stream { interval_ms } => {
-            cmd_packets.push(PacketExample {
-                name: "StreamStart".to_string(),
-                description: format!(
-                    "Begin streaming command every {}ms (watchdog keepalive)",
-                    interval_ms
-                ),
-                header_hex: format!(
-                    "{:02X} {:02X} 01 00 + JSON",
-                    packet::PROTOCOL_VERSION,
-                    packet::MessageType::StreamStart as u8
-                ),
-                payload_example: Some(example_payload),
-            });
-            cmd_packets.push(PacketExample {
-                name: "StreamStop".to_string(),
-                description: "Stop the active command stream".to_string(),
-                header_hex: format!(
-                    "{:02X} {:02X} 01 00",
-                    packet::PROTOCOL_VERSION,
-                    packet::MessageType::StreamStop as u8
-                ),
-                payload_example: None,
-            });
+            cmd_packets[0].description = format!(
+                "Send command packet (repeat every ~{}ms; each packet processed on arrival)",
+                interval_ms
+            );
             format!(
-                "Client --StreamStart(0x12)--> Robot --StreamAck(0x14)--> Client (robot re-sends to HW every {}ms) | Client --StreamStop(0x13)--> Robot --StreamAck(0x14)--> Client",
+                "Client --Command(0x10) every ~{}ms--> Robot --CommandAck(0x11)--> Client",
                 interval_ms
             )
         }
@@ -224,6 +214,10 @@ async fn discover(State(reg): State<Arc<SensorRegistry>>) -> Json<DiscoverRespon
                 info: format!("/{}/info", s.id),
                 data: format!("/{}/data", s.id),
                 command: format!("/{}/command", s.id),
+                estop: s.has_estop.then(|| format!("/{}/estop", s.id)),
+                config: s.has_config.then(|| format!("/{}/config", s.id)),
+                calibrate: s.has_calibrate.then(|| format!("/{}/calibrate", s.id)),
+                endpoints: s.has_endpoint_access.then(|| format!("/{}/endpoints", s.id)),
             };
             SensorSummary {
                 id: s.id,
@@ -285,6 +279,122 @@ async fn sensor_command(
     }))
 }
 
+async fn sensor_estop(
+    State(state): State<SensorState>,
+) -> Result<Json<CommandResult>, (StatusCode, Json<ErrorResponse>)> {
+    let result = state.driver.estop().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?;
+    Ok(Json(CommandResult {
+        status: "ok".to_string(),
+        result,
+    }))
+}
+
+async fn upload_endpoints(
+    State(ep_map): State<SharedEndpointMap>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let content = std::str::from_utf8(&body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error: format!("invalid UTF-8: {e}") }),
+        )
+    })?;
+    let count = load_from_str(&ep_map, content).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error: e.to_string() }),
+        )
+    })?;
+    Ok(Json(serde_json::json!({ "loaded": count, "status": "ok" })))
+}
+
+async fn sensor_read_config(
+    State(state): State<SensorState>,
+) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    let result = state.driver.read_config().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?;
+    Ok(Json(result))
+}
+
+async fn sensor_write_config(
+    State(state): State<SensorState>,
+    Json(payload): Json<Value>,
+) -> Result<Json<CommandResult>, (StatusCode, Json<ErrorResponse>)> {
+    let result = state.driver.write_config(&payload).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?;
+    Ok(Json(CommandResult {
+        status: "ok".to_string(),
+        result,
+    }))
+}
+
+async fn sensor_calibrate(
+    State(state): State<SensorState>,
+    Json(payload): Json<Value>,
+) -> Result<Json<CommandResult>, (StatusCode, Json<ErrorResponse>)> {
+    let result = state.driver.calibrate(&payload).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?;
+    Ok(Json(CommandResult {
+        status: "ok".to_string(),
+        result,
+    }))
+}
+
+async fn sensor_list_endpoints(
+    State(state): State<SensorState>,
+) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    let result = state.driver.list_endpoints().map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e.to_string() }))
+    })?;
+    Ok(Json(result))
+}
+
+async fn sensor_read_endpoint(
+    State(state): State<SensorState>,
+    Path(path): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    let result = state.driver.read_endpoint(&path).map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e.to_string() }))
+    })?;
+    Ok(Json(result))
+}
+
+async fn sensor_write_endpoint(
+    State(state): State<SensorState>,
+    Path(path): Path<String>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    let result = state.driver.write_endpoint(&path, &payload).map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e.to_string() }))
+    })?;
+    Ok(Json(result))
+}
+
 // ── Scalar UI ───────────────────────────────────────────────────────────────
 
 async fn serve_scalar() -> Html<String> {
@@ -307,13 +417,15 @@ async fn serve_scalar() -> Html<String> {
 
 // ── Router builder ──────────────────────────────────────────────────────────
 
-pub fn build_router(registry: Arc<SensorRegistry>) -> Router {
+pub fn build_router(registry: Arc<SensorRegistry>, endpoint_map: SharedEndpointMap) -> Router {
     let openapi = build_openapi(&registry);
     let openapi = Arc::new(openapi);
 
     let mut app = Router::new()
         .route("/discover", get(discover))
-        .with_state(registry.clone());
+        .with_state(registry.clone())
+        .route("/odrive/endpoints", post(upload_endpoints))
+        .with_state(endpoint_map);
 
     // Generate per-sensor routes: /{sensor_id}/info, /{sensor_id}/data, /{sensor_id}/command
     for sensor in registry.list() {
@@ -323,11 +435,29 @@ pub fn build_router(registry: Arc<SensorRegistry>) -> Router {
             info: Arc::new(sensor.clone()),
         };
 
-        let sensor_router = Router::new()
+        let mut sensor_router = Router::new()
             .route("/info", get(sensor_info))
             .route("/data", get(sensor_data))
-            .route("/command", post(sensor_command))
-            .with_state(state);
+            .route("/command", post(sensor_command));
+
+        if sensor.has_estop {
+            sensor_router = sensor_router.route("/estop", post(sensor_estop));
+        }
+        if sensor.has_config {
+            sensor_router = sensor_router
+                .route("/config", get(sensor_read_config))
+                .route("/config", post(sensor_write_config));
+        }
+        if sensor.has_calibrate {
+            sensor_router = sensor_router.route("/calibrate", post(sensor_calibrate));
+        }
+        if sensor.has_endpoint_access {
+            sensor_router = sensor_router
+                .route("/endpoints", get(sensor_list_endpoints))
+                .route("/endpoint/{*path}", get(sensor_read_endpoint).post(sensor_write_endpoint));
+        }
+
+        let sensor_router = sensor_router.with_state(state);
 
         app = app.nest(&format!("/{}", sensor.id), sensor_router);
     }
@@ -376,7 +506,7 @@ fn build_openapi(registry: &SensorRegistry) -> utoipa::openapi::OpenApi {
         )),
         info(
             title = "Capra Rove Sensor Interface",
-            description = "Robot sensor API with UDP transport and HTTP documentation.\n\n## Discovery\n\n`GET /discover` lists all sensors with their endpoints and UDP ports.\n\n## Per-Sensor Endpoints\n\nEach sensor has its own routes:\n- `GET /{sensor_id}/info` - schema, commands, UDP packet format\n- `GET /{sensor_id}/data` - current data snapshot\n- `POST /{sensor_id}/command` - send a command\n\n## UDP Protocol\n\nPackets: `| version (1B) | msg_type (1B) | seq_num (2B LE) | JSON payload |`\n\n### Data Subscription\nSend **Subscribe (0x01)** to the sensor's data port. The robot pushes **Data (0x03)** packets to your address continuously. Send **Unsubscribe (0x02)** to stop.\n\n### Commands\n- **REST sensors**: Send **Command (0x10)**, get **CommandAck (0x11)**.\n- **Stream sensors** (CAN watchdog): Send **StreamStart (0x12)** once, robot re-sends to hardware at interval. **StreamStop (0x13)** to cancel.",
+            description = "Robot sensor API with UDP transport and HTTP documentation.\n\n## Discovery\n\n`GET /discover` lists all sensors with their endpoints and UDP ports.\n\n## Per-Sensor Endpoints\n\nEach sensor has its own routes:\n- `GET /{sensor_id}/info` - schema, commands, UDP packet format\n- `GET /{sensor_id}/data` - current data snapshot\n- `POST /{sensor_id}/command` - send a command\n- `POST /{sensor_id}/estop` - emergency stop (supported drivers only)\n\n## UDP Protocol\n\nPackets: `| version (1B) | msg_type (1B) | seq_num (2B LE) | JSON payload |`\n\n### Data Subscription\nSend **Subscribe (0x01)** to the sensor's data port. The robot pushes **Data (0x03)** packets to your address continuously. Send **Unsubscribe (0x02)** to stop.\n\n### Commands\n- **REST sensors**: Send **Command (0x10)**, get **CommandAck (0x11)**.\n- **Stream sensors** (CAN watchdog): Send **StreamStart (0x12)** once, robot re-sends to hardware at interval. **StreamStop (0x13)** to cancel.",
             version = "0.1.0"
         ),
         tags(
@@ -386,6 +516,68 @@ fn build_openapi(registry: &SensorRegistry) -> utoipa::openapi::OpenApi {
     struct ApiDoc;
 
     let mut doc = ApiDoc::openapi();
+
+    // Add /odrive/endpoints upload path
+    let upload_ep_op = OperationBuilder::new()
+        .tag("odrive")
+        .summary(Some("Upload flat_endpoints.json"))
+        .description(Some(
+            "Upload the ODrive `flat_endpoints.json` file to enable config read/write on all nodes.\n\n\
+             **How to get the file** (on your dev machine where odrivetool is installed):\n\
+             ```\npython3 -c \"import odrive, os; print(os.path.dirname(odrive.__file__))\"\n```\
+             Then find `flat_endpoints.json` in that directory.\n\n\
+             **Upload via curl:**\n\
+             ```\ncurl -X POST http://raspberrypi.local:8080/odrive/endpoints \\\n  \
+             -H 'Content-Type: application/json' \\\n  \
+             --data-binary @flat_endpoints.json\n```\n\n\
+             Or paste the file contents directly in the request body below.",
+        ))
+        .request_body(Some(
+            RequestBodyBuilder::new()
+                .content(
+                    "application/json",
+                    ContentBuilder::new()
+                        .example(Some(serde_json::json!({
+                            "fw_version": "0.6.11",
+                            "hw_version": "1.0.0",
+                            "endpoints": {
+                                "axis0.motor.config.phase_resistance": {"id": 123, "type": "float"},
+                                "axis0.controller.config.vel_limit": {"id": 456, "type": "float"}
+                            }
+                        })))
+                        .build(),
+                )
+                .required(Some(utoipa::openapi::Required::True))
+                .build(),
+        ))
+        .response(
+            "200",
+            ResponseBuilder::new()
+                .description("Endpoints loaded")
+                .content(
+                    "application/json",
+                    ContentBuilder::new()
+                        .example(Some(serde_json::json!({"loaded": 1234, "status": "ok"})))
+                        .build(),
+                )
+                .build(),
+        )
+        .build();
+
+    let mut paths = PathsBuilder::new()
+        .path(
+            "/odrive/endpoints",
+            PathItemBuilder::new()
+                .operation(HttpMethod::Post, upload_ep_op)
+                .build(),
+        );
+
+    doc.tags.get_or_insert_with(Vec::new).push(
+        utoipa::openapi::tag::TagBuilder::new()
+            .name("odrive")
+            .description(Some("ODrive global operations (endpoint map upload)"))
+            .build(),
+    );
 
     // Add /discover path manually
     let discover_op = OperationBuilder::new()
@@ -410,7 +602,7 @@ fn build_openapi(registry: &SensorRegistry) -> utoipa::openapi::OpenApi {
         )
         .build();
 
-    let mut paths = PathsBuilder::new().path(
+    paths = paths.path(
         "/discover",
         PathItemBuilder::new()
             .operation(HttpMethod::Get, discover_op)
@@ -529,6 +721,214 @@ fn build_openapi(registry: &SensorRegistry) -> utoipa::openapi::OpenApi {
                     .operation(HttpMethod::Post, cmd_op)
                     .build(),
             );
+
+        if sensor.has_estop {
+            let estop_op = OperationBuilder::new()
+                .tag(tag)
+                .summary(Some(format!("{} - Emergency Stop", sensor.display_name)))
+                .description(Some(format!(
+                    "Send an **immediate emergency stop** to **{}**.\n\nDisarms the motor with `ESTOP_REQUESTED`. No payload required.",
+                    sensor.display_name
+                )))
+                .response(
+                    "200",
+                    ResponseBuilder::new()
+                        .description("E-stop acknowledged")
+                        .content(
+                            "application/json",
+                            ContentBuilder::new()
+                                .schema(Some(RefOr::Ref(utoipa::openapi::Ref::from_schema_name(
+                                    "CommandResult",
+                                ))))
+                                .build(),
+                        )
+                        .build(),
+                )
+                .build();
+
+            paths = paths.path(
+                format!("{}/estop", base),
+                PathItemBuilder::new()
+                    .operation(HttpMethod::Post, estop_op)
+                    .build(),
+            );
+        }
+
+        if sensor.has_config {
+            let config_read_op = OperationBuilder::new()
+                .tag(tag)
+                .summary(Some(format!("{} - Read Config", sensor.display_name)))
+                .description(Some(format!(
+                    "Read calibration/configuration parameters from **{}** via CAN SDO.\n\nReturns float and integer fields read from the drive firmware using `flat_endpoints.json`. Requires `ODRIVE_ENDPOINTS` env var at startup.",
+                    sensor.display_name
+                )))
+                .response(
+                    "200",
+                    ResponseBuilder::new()
+                        .description("Config parameters")
+                        .content("application/json", ContentBuilder::new().build())
+                        .build(),
+                )
+                .build();
+
+            let config_write_op = OperationBuilder::new()
+                .tag(tag)
+                .summary(Some(format!("{} - Write Config", sensor.display_name)))
+                .description(Some(format!(
+                    "Write configuration parameters to **{}** via CAN SDO.\n\n**Supported keys** (all optional):\n- `phase_resistance` (float, Ω)\n- `phase_inductance` (float, H)\n- `current_lim` (float, A)\n- `vel_limit` (float, rev/s)\n- `pos_gain` (float)\n- `vel_gain` (float)\n- `vel_integrator_gain` (float)\n- `pole_pairs` (int)\n- `cpr` (int, counts per revolution)",
+                    sensor.display_name
+                )))
+                .request_body(Some(
+                    RequestBodyBuilder::new()
+                        .content(
+                            "application/json",
+                            ContentBuilder::new()
+                                .example(Some(serde_json::json!({
+                                    "vel_limit": 20.0,
+                                    "current_lim": 40.0,
+                                    "vel_gain": 0.16,
+                                    "vel_integrator_gain": 0.32,
+                                })))
+                                .build(),
+                        )
+                        .required(Some(utoipa::openapi::Required::True))
+                        .build(),
+                ))
+                .response(
+                    "200",
+                    ResponseBuilder::new()
+                        .description("Written keys and any errors")
+                        .content(
+                            "application/json",
+                            ContentBuilder::new()
+                                .schema(Some(RefOr::Ref(utoipa::openapi::Ref::from_schema_name(
+                                    "CommandResult",
+                                ))))
+                                .build(),
+                        )
+                        .build(),
+                )
+                .build();
+
+            paths = paths
+                .path(
+                    format!("{}/config", base),
+                    PathItemBuilder::new()
+                        .operation(HttpMethod::Get, config_read_op)
+                        .operation(HttpMethod::Post, config_write_op)
+                        .build(),
+                );
+        }
+
+        if sensor.has_endpoint_access {
+            let list_op = OperationBuilder::new()
+                .tag(tag)
+                .summary(Some(format!("{} - List Endpoints", sensor.display_name)))
+                .description(Some(
+                    "List all endpoints in the loaded `flat_endpoints.json` map — \
+                     no CAN I/O, just metadata. Each entry shows `id`, `type`, and `access`.\n\n\
+                     Use `GET /{id}/endpoint/{path}` to read a specific value, \
+                     or `POST /{id}/endpoint/{path}` with `{\"value\": X}` to write one.".to_string()
+                ))
+                .response("200", ResponseBuilder::new()
+                    .description("Map of path → {id, type, access}")
+                    .content("application/json", ContentBuilder::new().build())
+                    .build())
+                .build();
+
+            let read_ep_op = OperationBuilder::new()
+                .tag(tag)
+                .summary(Some(format!("{} - Read Endpoint", sensor.display_name)))
+                .description(Some(
+                    "Read a single ODrive endpoint by its flat-endpoint path via CAN SDO.\n\n\
+                     **Example paths** (from `flat_endpoints.json`):\n\
+                     - `axis0.controller.config.vel_limit`\n\
+                     - `axis0.config.motor.phase_resistance`\n\
+                     - `inc_encoder0.config.cpr`\n\n\
+                     Returns `{path, value, type}`.".to_string()
+                ))
+                .response("200", ResponseBuilder::new()
+                    .description("Endpoint value")
+                    .content("application/json", ContentBuilder::new()
+                        .example(Some(serde_json::json!({"path": "axis0.controller.config.vel_limit", "value": 20.0, "type": "float"})))
+                        .build())
+                    .build())
+                .build();
+
+            let write_ep_op = OperationBuilder::new()
+                .tag(tag)
+                .summary(Some(format!("{} - Write Endpoint", sensor.display_name)))
+                .description(Some(
+                    "Write a single ODrive endpoint by its flat-endpoint path via CAN SDO.\n\n\
+                     Body must be `{\"value\": <number|bool>}` matching the endpoint type.\n\n\
+                     **Example**: `POST /{id}/endpoint/axis0.controller.config.vel_limit` with `{\"value\": 20.0}`".to_string()
+                ))
+                .request_body(Some(RequestBodyBuilder::new()
+                    .content("application/json", ContentBuilder::new()
+                        .example(Some(serde_json::json!({"value": 20.0})))
+                        .build())
+                    .required(Some(utoipa::openapi::Required::True))
+                    .build()))
+                .response("200", ResponseBuilder::new()
+                    .description("Write confirmed")
+                    .content("application/json", ContentBuilder::new()
+                        .example(Some(serde_json::json!({"path": "axis0.controller.config.vel_limit", "written": true})))
+                        .build())
+                    .build())
+                .build();
+
+            paths = paths
+                .path(format!("{}/endpoints", base), PathItemBuilder::new()
+                    .operation(HttpMethod::Get, list_op)
+                    .build())
+                .path(format!("{}/endpoint/{{path}}", base), PathItemBuilder::new()
+                    .operation(HttpMethod::Get, read_ep_op)
+                    .operation(HttpMethod::Post, write_ep_op)
+                    .build());
+        }
+
+        if sensor.has_calibrate {
+            let cal_op = OperationBuilder::new()
+                .tag(tag)
+                .summary(Some(format!("{} - Calibrate", sensor.display_name)))
+                .description(Some(format!(
+                    "Start a calibration sequence on **{}**.\n\n**Body**: `{{\"type\": \"full\" | \"motor\" | \"encoder_index\" | \"encoder_offset\"}}`\n\n| type | Axis State | Description |\n|---|---|---|\n| `full` | 3 | Full calibration (motor + encoder) |\n| `motor` | 4 | Motor calibration only |\n| `encoder_index` | 6 | Encoder index search |\n| `encoder_offset` | 7 | Encoder offset calibration |\n\nThe drive must be in **Idle** state before calibrating. The sequence runs asynchronously — poll `/data` to watch `axis_state` return to Idle (1).",
+                    sensor.display_name
+                )))
+                .request_body(Some(
+                    RequestBodyBuilder::new()
+                        .content(
+                            "application/json",
+                            ContentBuilder::new()
+                                .example(Some(serde_json::json!({"type": "full"})))
+                                .build(),
+                        )
+                        .required(Some(utoipa::openapi::Required::True))
+                        .build(),
+                ))
+                .response(
+                    "200",
+                    ResponseBuilder::new()
+                        .description("Calibration started")
+                        .content(
+                            "application/json",
+                            ContentBuilder::new()
+                                .schema(Some(RefOr::Ref(utoipa::openapi::Ref::from_schema_name(
+                                    "CommandResult",
+                                ))))
+                                .build(),
+                        )
+                        .build(),
+                )
+                .build();
+
+            paths = paths.path(
+                format!("{}/calibrate", base),
+                PathItemBuilder::new()
+                    .operation(HttpMethod::Post, cal_op)
+                    .build(),
+            );
+        }
 
         // Add sensor as a tag
         doc.tags.get_or_insert_with(Vec::new).push(

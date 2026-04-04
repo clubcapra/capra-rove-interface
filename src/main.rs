@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 mod core;
 mod drivers;
@@ -9,6 +10,7 @@ mod udp;
 use core::registry::SensorRegistry;
 use drivers::gps::GpsSensor;
 use drivers::motor_controller::MotorController;
+use drivers::odrive::{discover_nodes, endpoints::SharedEndpointMap, node::WatchdogConfig};
 use http::routes::build_router;
 use udp::server::spawn_sensor_udp;
 
@@ -22,18 +24,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     // --- Sensor Registration ---
-    // To add a new sensor:
-    //   1. Create src/drivers/my_sensor.rs implementing SensorDriver
-    //   2. Add `pub mod my_sensor;` to src/drivers/mod.rs
-    //   3. Register it here:
-
     let registry = Arc::new(SensorRegistry::new(5000));
 
-    registry.register(GpsSensor::new());
-    registry.register(MotorController::new("motor_fl", "Front-Left Motor"));
-    registry.register(MotorController::new("motor_fr", "Front-Right Motor"));
-    registry.register(MotorController::new("motor_rl", "Rear-Left Motor"));
-    registry.register(MotorController::new("motor_rr", "Rear-Right Motor"));
+    //registry.register(GpsSensor::new());
+
+    // --- ODrive Discovery ---
+    // Scans the CAN bus for heartbeat frames for 2 seconds.
+    // Each discovered node gets its own UDP ports and Scalar endpoints.
+    let odrive_iface = std::env::var("CAN_IFACE").unwrap_or_else(|_| "can0".to_string());
+    let watchdog = WatchdogConfig::default(); // 100ms, setpoint-only keepalive
+
+    let shared_endpoints: SharedEndpointMap = match discover_nodes(&odrive_iface, Duration::from_secs(2), watchdog).await {
+        Ok((nodes, ep_map)) => {
+            for node in nodes {
+                registry.register(node);
+            }
+            ep_map
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, iface = odrive_iface, "ODrive discovery failed — continuing without ODrives");
+            drivers::odrive::endpoints::new_shared()
+        }
+    };
 
     // --- Start UDP listeners ---
     for (id, driver) in registry.iter_drivers() {
@@ -42,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // --- Start HTTP server with Scalar UI ---
-    let app = build_router(registry.clone());
+    let app = build_router(registry.clone(), shared_endpoints);
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
 
     tracing::info!("Scalar UI:   http://localhost:8080/docs");
